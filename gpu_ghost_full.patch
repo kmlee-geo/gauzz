@@ -1,0 +1,235 @@
+diff --git a/dolfin/la/PETScVector.cpp b/dolfin/la/PETScVector.cpp
+index 69e179548..198710eb3 100644
+--- a/dolfin/la/PETScVector.cpp
++++ b/dolfin/la/PETScVector.cpp
+@@ -50,7 +50,8 @@ PETScVector::PETScVector() : PETScVector(MPI_COMM_WORLD)
+   // Do nothing
+ }
+ //-----------------------------------------------------------------------------
+-PETScVector::PETScVector(MPI_Comm comm) : _x(nullptr)
++PETScVector::PETScVector(MPI_Comm comm)
++  : _x(nullptr), _ghost_local(nullptr), _ghost_scatter(nullptr)
+ {
+   PetscErrorCode ierr = VecCreate(comm, &_x);
+   CHECK_ERROR("VecCreate");
+@@ -69,13 +70,15 @@ PETScVector::PETScVector(const SparsityPattern& sparsity_pattern)
+   _init(sparsity_pattern.local_range(0), {}, {});
+ }
+ //-----------------------------------------------------------------------------
+-PETScVector::PETScVector(Vec x) : _x(x)
++PETScVector::PETScVector(Vec x)
++  : _x(x), _ghost_local(nullptr), _ghost_scatter(nullptr)
+ {
+   // Increase reference count to PETSc object
+   PetscObjectReference((PetscObject)_x);
+ }
+ //-----------------------------------------------------------------------------
+-PETScVector::PETScVector(const PETScVector& v) : _x(nullptr)
++PETScVector::PETScVector(const PETScVector& v)
++  : _x(nullptr), _ghost_local(nullptr), _ghost_scatter(nullptr)
+ {
+   dolfin_assert(v._x);
+ 
+@@ -94,6 +97,10 @@ PETScVector::PETScVector(const PETScVector& v) : _x(nullptr)
+ //-----------------------------------------------------------------------------
+ PETScVector::~PETScVector()
+ {
++  if (_ghost_scatter)
++    VecScatterDestroy(&_ghost_scatter);
++  if (_ghost_local)
++    VecDestroy(&_ghost_local);
+   if (_x)
+     VecDestroy(&_x);
+ }
+@@ -209,9 +216,23 @@ void PETScVector::get_local(double* block, std::size_t m,
+ 
+   // Use array access if no ghost points, otherwise use VecGetValues
+   // on local ghosted form of vector
+-  if (!xg)
++  if (!xg && _ghost_local)
+   {
+-    // Get pointer to PETSc vector data
++    // GPU MPI path: _ghost_local holds owned[0..n-1] + ghost[n..n+ng-1]
++    // (populated by update_ghost_values); use it for all local row access.
++    const PetscScalar* data;
++    ierr = VecGetArrayRead(_ghost_local, &data);
++    CHECK_ERROR("VecGetArrayRead(_ghost_local)");
++
++    for (std::size_t i = 0; i < m; ++i)
++      block[i] = data[rows[i]];
++
++    ierr = VecRestoreArrayRead(_ghost_local, &data);
++    CHECK_ERROR("VecRestoreArrayRead(_ghost_local)");
++  }
++  else if (!xg)
++  {
++    // No ghost: read directly from the main vector
+     const PetscScalar* data;
+     ierr = VecGetArrayRead(_x, &data);
+     CHECK_ERROR("VecGetArrayRead");
+@@ -219,7 +240,6 @@ void PETScVector::get_local(double* block, std::size_t m,
+     for (std::size_t i = 0; i < m; ++i)
+       block[i] = data[rows[i]];
+ 
+-    // Restore array
+     ierr = VecRestoreArrayRead(_x, &data);
+     CHECK_ERROR("VecRestoreArrayRead");
+   }
+@@ -427,12 +447,11 @@ void PETScVector::update_ghost_values()
+   dolfin_assert(_x);
+   PetscErrorCode ierr;
+ 
+-  // Check of vector is ghosted
++  // Standard VECMPI ghost path: VecGhostGetLocalForm + VecGhostUpdateBegin/End
+   Vec xg;
+   ierr = VecGhostGetLocalForm(_x, &xg);
+   CHECK_ERROR("VecGhostGetLocalForm");
+ 
+-  // If ghosted, update
+   if (xg)
+   {
+     ierr = VecGhostUpdateBegin(_x, INSERT_VALUES, SCATTER_FORWARD);
+@@ -443,6 +462,34 @@ void PETScVector::update_ghost_values()
+ 
+   ierr = VecGhostRestoreLocalForm(_x, &xg);
+   CHECK_ERROR("VecGhostRestoreLocalForm");
++
++  // GPU MPI vector path (VECMPICUDA/VECMPIHIP/VECMPIKOKKOS):
++  // VecMPISetGhost is a no-op for GPU vec types, so ghost scatter was built
++  // manually in _init().  Sync owned + ghost values into _ghost_local so that
++  // get_local() can access them without a second GPU-to-host transfer.
++  if (_ghost_scatter)
++  {
++    PetscInt owned_n;
++    ierr = VecGetLocalSize(_x, &owned_n);
++    CHECK_ERROR("VecGetLocalSize");
++
++    // Copy owned values GPU -> host _ghost_local[0..owned_n-1]
++    const PetscScalar* gpu_ro;
++    PetscScalar*       loc_rw;
++    ierr = VecGetArrayRead(_x, &gpu_ro);     CHECK_ERROR("VecGetArrayRead(_x)");
++    ierr = VecGetArray(_ghost_local, &loc_rw); CHECK_ERROR("VecGetArray(_ghost_local)");
++    ierr = PetscArraycpy(loc_rw, gpu_ro, owned_n); CHECK_ERROR("PetscArraycpy owned");
++    ierr = VecRestoreArray(_ghost_local, &loc_rw); CHECK_ERROR("VecRestoreArray(_ghost_local)");
++    ierr = VecRestoreArrayRead(_x, &gpu_ro);   CHECK_ERROR("VecRestoreArrayRead(_x)");
++
++    // Scatter ghost values: global GPU vec -> _ghost_local[owned_n..owned_n+nghost-1]
++    ierr = VecScatterBegin(_ghost_scatter, _x, _ghost_local,
++                           INSERT_VALUES, SCATTER_FORWARD);
++    CHECK_ERROR("VecScatterBegin(ghost)");
++    ierr = VecScatterEnd(_ghost_scatter, _x, _ghost_local,
++                         INSERT_VALUES, SCATTER_FORWARD);
++    CHECK_ERROR("VecScatterEnd(ghost)");
++  }
+ }
+ //-----------------------------------------------------------------------------
+ const PETScVector& PETScVector::operator+= (const GenericVector& x)
+@@ -898,20 +945,80 @@ void PETScVector::_init(std::pair<std::size_t, std::size_t> range,
+   ierr = VecSetSizes(_x, local_size, PETSC_DECIDE);
+   CHECK_ERROR("VecSetSizes");
+ 
+-  // Get PETSc Vec type
++  // Get PETSc Vec backend type (CPU/GPU) and accept all *MPI* backends
+   VecType vec_type = nullptr;
+   ierr = VecGetType(_x, &vec_type);
+   CHECK_ERROR("VecGetType");
+-
+-  // Add ghost points if Vec type is MPI (throw an error if Vec is not
+-  // VECMPI and ghost entry vector is not empty)
+-  if (strcmp(vec_type, VECMPI) == 0)
++  
++  // Treat all MPI vector backends as MPI (CPU/GPU): VECMPI, VECMPICUDA, VECMPIHIP, VECMPIKOKKOS, ...
++  PetscBool is_mpi_vec = PETSC_FALSE;
+   {
+-    ierr = VecMPISetGhost(_x, ghost_indices.size(), ghost_indices.data());
+-    CHECK_ERROR("VecMPISetGhost");
++    PetscBool match = PETSC_FALSE;
++    ierr = PetscObjectTypeCompare((PetscObject)_x, VECMPI, &match); CHECK_ERROR("PetscObjectTypeCompare");
++    if (match) is_mpi_vec = PETSC_TRUE;
++  #if defined(PETSC_HAVE_CUDA)
++    if (!is_mpi_vec) { ierr = PetscObjectTypeCompare((PetscObject)_x, VECMPICUDA, &match); CHECK_ERROR("PetscObjectTypeCompare"); if (match) is_mpi_vec = PETSC_TRUE; }
++  #endif
++  #if defined(PETSC_HAVE_HIP)
++    if (!is_mpi_vec) { ierr = PetscObjectTypeCompare((PetscObject)_x, VECMPIHIP, &match); CHECK_ERROR("PetscObjectTypeCompare"); if (match) is_mpi_vec = PETSC_TRUE; }
++  #endif
++  #if defined(PETSC_HAVE_KOKKOS)
++    if (!is_mpi_vec) { ierr = PetscObjectTypeCompare((PetscObject)_x, VECMPIKOKKOS, &match); CHECK_ERROR("PetscObjectTypeCompare"); if (match) is_mpi_vec = PETSC_TRUE; }
++  #endif
+   }
+-  else if (!ghost_indices.empty())
++  
++  // Detect GPU MPI vector type (VECMPICUDA / VECMPIHIP / VECMPIKOKKOS)
++  PetscBool is_gpu_mpi = PETSC_FALSE;
+   {
++    PetscBool match = PETSC_FALSE;
++  #if defined(PETSC_HAVE_CUDA)
++    if (!is_gpu_mpi) { ierr = PetscObjectTypeCompare((PetscObject)_x, VECMPICUDA,   &match); CHECK_ERROR("PetscObjectTypeCompare"); if (match) is_gpu_mpi = PETSC_TRUE; }
++  #endif
++  #if defined(PETSC_HAVE_HIP)
++    if (!is_gpu_mpi) { ierr = PetscObjectTypeCompare((PetscObject)_x, VECMPIHIP,    &match); CHECK_ERROR("PetscObjectTypeCompare"); if (match) is_gpu_mpi = PETSC_TRUE; }
++  #endif
++  #if defined(PETSC_HAVE_KOKKOS)
++    if (!is_gpu_mpi) { ierr = PetscObjectTypeCompare((PetscObject)_x, VECMPIKOKKOS, &match); CHECK_ERROR("PetscObjectTypeCompare"); if (match) is_gpu_mpi = PETSC_TRUE; }
++  #endif
++  }
++
++  // If MPI Vec backend, allow ghost entries; otherwise error if ghosts requested
++  if (is_mpi_vec) {
++    if (!ghost_indices.empty()) {
++      if (is_gpu_mpi) {
++        // VecMPISetGhost only works for plain VECMPI; for GPU MPI vectors it is a
++        // no-op (type compare fails), so ghost scatter must be built manually.
++        // Clean up any previous ghost data from a prior _init call.
++        if (_ghost_scatter) { VecScatterDestroy(&_ghost_scatter); _ghost_scatter = nullptr; }
++        if (_ghost_local)   { VecDestroy(&_ghost_local);          _ghost_local   = nullptr; }
++
++        const PetscInt nghost  = (PetscInt)ghost_indices.size();
++        const PetscInt owned_n = (PetscInt)local_size;
++
++        // Host sequential vector: owned[0..n-1] + ghost[n..n+ng-1]
++        ierr = VecCreateSeq(PETSC_COMM_SELF, owned_n + nghost, &_ghost_local);
++        CHECK_ERROR("VecCreateSeq(_ghost_local)");
++
++        // Scatter: ghost global indices -> _ghost_local[owned_n..owned_n+nghost-1]
++        IS from_is, to_is;
++        ierr = ISCreateGeneral(PetscObjectComm((PetscObject)_x),
++                               nghost, (const PetscInt*)ghost_indices.data(),
++                               PETSC_COPY_VALUES, &from_is);
++        CHECK_ERROR("ISCreateGeneral(ghost from)");
++        ierr = ISCreateStride(PETSC_COMM_SELF, nghost, owned_n, 1, &to_is);
++        CHECK_ERROR("ISCreateStride(ghost to)");
++        ierr = VecScatterCreate(_x, from_is, _ghost_local, to_is, &_ghost_scatter);
++        CHECK_ERROR("VecScatterCreate(ghost)");
++        ierr = ISDestroy(&from_is); CHECK_ERROR("ISDestroy");
++        ierr = ISDestroy(&to_is);   CHECK_ERROR("ISDestroy");
++      } else {
++        // Standard VECMPI path
++        ierr = VecMPISetGhost(_x, (PetscInt)ghost_indices.size(),
++                              (PetscInt*)ghost_indices.data());
++        CHECK_ERROR("VecMPISetGhost");
++      }
++    }
++  } else if (!ghost_indices.empty()) {
+     dolfin_error("PETScVector.cpp",
+                  "initialize vector",
+                  "Sequential PETSc Vec objects cannot have ghost entries");
+diff --git a/dolfin/la/PETScVector.h b/dolfin/la/PETScVector.h
+index 0f3ede025..4ddd21c53 100644
+--- a/dolfin/la/PETScVector.h
++++ b/dolfin/la/PETScVector.h
+@@ -276,6 +276,14 @@ namespace dolfin
+     // PETSc Vec pointer
+     Vec _x;
+ 
++    // Ghost communication for GPU MPI vectors (mpicuda/mpihip):
++    // VecMPISetGhost is a no-op for non-VECMPI types, so we manage
++    // ghost scatter manually. _ghost_local holds owned[0..n-1] +
++    // ghost[n..n+ng-1] on host; _ghost_scatter copies ghost values
++    // from the global GPU vec into _ghost_local[n..].
++    Vec        _ghost_local;    // host seq vec: size = local + nghost
++    VecScatter _ghost_scatter;  // global GPU vec -> _ghost_local ghost part
++
+     // PETSc norm types
+     static const std::map<std::string, NormType> norm_types;
+ 
+

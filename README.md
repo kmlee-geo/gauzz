@@ -1,4 +1,4 @@
-# GAUZZ: GPU And UZawa for Geodynamic simulations
+# GAUZZ: GPU And UZawa for geodynamic simulations
 GPU-accelerated FEniCS environment built on CUDA 12.5, PETSc 3.24, DOLFIN 2019.1.0, and CuPy 13.3, packaged as a Docker image.
 
 The image was developed and tested on an RTX 6000 Ada (CC 8.9). For other GPUs, change `--with-cuda-arch=89` in the `Dockerfile` (Ampere=80, Hopper=90, Turing=75) before building — otherwise PETSc kernels will fail at runtime with `cudaErrorNoKernelImageForDevice`.
@@ -21,7 +21,7 @@ If the GPU shows up here, the host side is fine.
 ## Layout
 
 ```
-gpu_fenics/
+gauzz_1_0_0/
 ├── Dockerfile
 ├── gpu_ghost_full.patch     # DOLFIN GPU MPI Ghost Vec patch — applied during build
 ├── README.md
@@ -31,7 +31,7 @@ gpu_fenics/
 ## Build
 
 ```bash
-cd ~/gpu_fenics
+cd ~/gauzz_1_0_0
 docker build -t gpu-fenics:latest .
 ```
 
@@ -51,7 +51,7 @@ docker run -it --gpus all --ipc=host \
 Inside the container, make the example scripts executable once and you're set:
 
 ```bash
-cd /home/work/gpu_fenics
+cd /home/work/gauzz_1_0_0
 find . -name "*.sh" -exec chmod +x {} +
 ```
 

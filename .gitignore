@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Large benchmark reference data (kept in Zenodo deposit)
+codes/*/analytical_solutions/*.h5
+
+*.h5
